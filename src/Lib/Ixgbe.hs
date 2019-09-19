@@ -35,7 +35,7 @@ import           Lib.Prelude             hiding ( get
 
 import           Control.Monad.Catch
 import           Control.Monad.Logger
-import           Data.IORef
+import           Data.IORef.Unboxed
 import qualified Data.Text                     as T
 import qualified Data.Vector                   as V
 import           Foreign.Storable               ( sizeOf
@@ -47,6 +47,8 @@ import           Foreign.Storable               ( sizeOf
 import           Numeric                        ( showHex )
 import           System.IO.Error                ( userError )
 import           System.Posix.Unistd            ( usleep )
+import qualified Data.Vector.Storable.Mutable  as VS
+import Test.Inspection
 
 data Device = Device { devBasePtr :: Ptr Word32
                      , devBdf :: BusDeviceFunction
@@ -275,25 +277,29 @@ reset = do
 
 -- $ Operations
 
-receive :: Device -> Int -> Int -> IO [Ptr PacketBuf]
-receive dev id num = do
-  index <- readIORef (rxqIndexRef queue)
-  go index 0 []
+receive :: Device -> Int -> Int -> VS.IOVector (Ptr PacketBuf) -> IO ()
+receive dev id num buffers = do
+  index <- readIORefU (rxqIndexRef queue)
+  index' <- go index 0
+  when (index' /= 0) $ do
+    set dev (RDT id) $ fromIntegral (index' - 1)
+    writeIORefU (rxqIndexRef queue) index'
  where
   queue = devRxQueues dev `V.unsafeIndex` id
   memPool = rxqMemPool queue
 
-  go !index !iteration bufs
-    | iteration == num = postProcess
+  go !index !iteration
+    | iteration == num = return index
     | otherwise = do
       descriptor <- peek descPtr
       if isDone descriptor
-        then if not $ isEndOfPacket descriptor
-          then throwIO $ userError "Multi-segment packets are not supported."
-          else do
+  --       then if not $ isEndOfPacket descriptor
+  --         then throwIO $ userError "Multi-segment packets are not supported."
+          then do
             -- Remember the old buffer to give to the caller.
             bufPtr <- idToPtr memPool <$> unsafeRxGetMapping queue index
             pokeSize bufPtr $ fromIntegral $ rdLength descriptor
+            VS.unsafeWrite buffers iteration bufPtr
 
             -- Allocate a new buffer and reset the descriptor.
             newBufPtr <- allocateBuf memPool
@@ -301,35 +307,32 @@ receive dev id num = do
             PhysAddr physAddr <- peekAddr newBufPtr
             poke descPtr ReceiveRead {rdBufPhysAddr = physAddr, rdHeaderAddr = 0}
 
-            go ((index + 1) `rem` numRxQueueEntries) (iteration + 1) (bufPtr : bufs)
-        else postProcess
+            go ((index + 1) `rem` numRxQueueEntries) (iteration + 1)
+        else return index
     where
       descPtr = rxDescriptor queue index
-
-      postProcess = do
-        when (index /= 0) $ do
-          let j = index - 1
-          set dev (RDT id) $ fromIntegral j
-          writeIORef (rxqIndexRef queue) index
-        return bufs
 
 txCleanBatch :: Int
 txCleanBatch = 32
 
-send :: Device -> Int -> MemPool -> [Ptr PacketBuf] -> IO ()
-send _ _ _ [] = return ()
-send dev id memPool bufs = do
-  let txQueue = devTxQueues dev V.! id
-  clean txQueue
-  cleanIndex <- readIORef (txqCleanRef txQueue)
-  go txQueue cleanIndex bufs
-  set dev (TDT id)
-    =<< (\index -> fromIntegral $ (index - 1) `mod` numTxQueueEntries)
-    <$> readIORef (txqIndexRef txQueue)
+send :: Device -> Int -> MemPool -> VS.IOVector (Ptr PacketBuf) -> IO ()
+send dev id memPool bufs
+  | VS.null bufs = return ()
+  | otherwise = do
+    let txQueue = devTxQueues dev V.! id
+    clean txQueue
+    cleanIndex <- readIORefU (txqCleanRef txQueue)
+    go txQueue cleanIndex (VS.length bufs)
+    set dev (TDT id)
+      =<< (\index -> fromIntegral $ (index - 1) `mod` numTxQueueEntries)
+      <$> readIORefU (txqIndexRef txQueue)
  where
-  go queue !cleanIndex (bufPtr : bufPtrs) = do
+  go _ _ 0 = return ()
+  go queue !cleanIndex !iBuf = do
+    let iBuf' = iBuf - 1
+    bufPtr <- VS.unsafeRead bufs iBuf'
     let indexRef = txqIndexRef queue
-    curIndex <- readIORef indexRef
+    curIndex <- readIORefU indexRef
     let next = curIndex + 1 `rem` numTxQueueEntries
     unless (next == cleanIndex) $ do
       bufId             <- peekId bufPtr
@@ -337,7 +340,7 @@ send dev id memPool bufs = do
       size              <- peekSize bufPtr
 
       txMap queue curIndex bufId
-      modifyIORef' indexRef (\cur -> (cur + 1) `rem` numTxQueueEntries)
+      writeIORefU indexRef ((curIndex + 1) `rem` numTxQueueEntries)
 
       let
         endOfPacket        = 0x1000000
@@ -359,11 +362,10 @@ send dev id memPool bufs = do
           , tdCmdTypeLen   = fromIntegral $ cmdTypeLen size
           , tdOlInfoStatus = fromIntegral $ shift size 14
           }
-      go queue cleanIndex bufPtrs
-  go _ _ [] = return ()
+      go queue cleanIndex iBuf'
   clean queue = do
-    curIndex   <- readIORef (txqIndexRef queue)
-    cleanIndex <- readIORef (txqCleanRef queue)
+    curIndex   <- readIORefU (txqIndexRef queue)
+    cleanIndex <- readIORefU (txqCleanRef queue)
     let cleanable = if curIndex - cleanIndex < 0
           then numTxQueueEntries + (curIndex - cleanIndex)
           else curIndex - cleanIndex
@@ -374,7 +376,7 @@ send dev id memPool bufs = do
       descriptor <- peek $ txqDescriptor queue cleanupTo
       when (testBit (tdStatus descriptor) 0) $ do
         cleanDescriptor cleanIndex cleanupTo
-        writeIORef (txqCleanRef queue) ((cleanupTo + 1) `rem` numTxQueueEntries)
+        writeIORefU (txqCleanRef queue) ((cleanupTo + 1) `rem` numTxQueueEntries)
         clean queue
    where
     cleanDescriptor !i !end | i == end + 1 = return ()
@@ -657,3 +659,5 @@ waitClear dev register value = waitUntil dev register value (== 0)
 -- $ Helpers
 memPoolOf :: Device -> Int -> MemPool
 memPoolOf dev id = rxqMemPool $ devRxQueues dev V.! id
+
+-- inspect (mkObligation 'receive NoAllocation)

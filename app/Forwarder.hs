@@ -14,6 +14,9 @@ import qualified Data.Text            as T
 import           Foreign.Storable     (peekByteOff, pokeByteOff)
 import           Protolude
 import           System.Clock
+import qualified Data.Vector.Storable as V
+import qualified Data.Vector.Storable.Mutable as VM
+import Control.Monad.ST (RealWorld)
 import Text.Read
 
 newtype App a = App { runApp :: LoggingT IO a } deriving (Functor, Applicative, Monad, MonadIO, MonadCatch, MonadThrow, MonadLogger)
@@ -37,9 +40,10 @@ loop :: IORef Int -> Device -> Device -> Int -> IO ()
 loop counter dev1 dev2 batchSize = do
   let clock = Monotonic
   timeRef <- newIORef (TimeSpec {sec = 0, nsec = 0})
+  pkts <- VM.new batchSize
   forever $ do
-    forward dev1 dev2 batchSize
-    forward dev2 dev1 batchSize
+    forward dev1 dev2 batchSize pkts
+    forward dev2 dev1 batchSize pkts
     !c <- readIORef counter
     when
       (c .&. 0xF == 0)
@@ -75,11 +79,11 @@ loop counter dev1 dev2 batchSize = do
       )
     modifyIORef' counter (+ 1)
 
-forward :: Device -> Device -> Int -> IO ()
-forward rxDev txDev batchSize = do
-  !pkts <- receive rxDev 0 batchSize
-  mapM_ touchPacket pkts
-  send txDev 0 (memPoolOf rxDev 0) (reverse pkts)
+-- forward :: Device -> Device -> Int -> VM.IOVector (Ptr PacketBuf) -> IO ()
+forward rxDev txDev batchSize pkts = do
+  receive rxDev 0 batchSize pkts
+  V.mapM_ touchPacket =<< V.unsafeFreeze pkts
+  send txDev 0 (memPoolOf rxDev 0) pkts
  where
   touchPacket ptr =
     pokeByteOff ptr 24 =<< (+ 1) <$> (peekByteOff ptr 24 :: IO Word8)

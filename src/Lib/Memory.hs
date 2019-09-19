@@ -39,7 +39,7 @@ import qualified Data.Array.Base               as Array
 import           Data.Binary.Get
 import qualified Data.ByteString               as B
 import           Data.ByteString.Unsafe
-import           Data.IORef
+import           Data.IORef.Unboxed
 import           Foreign.Marshal.Utils          ( copyBytes )
 import           Foreign.Ptr                    ( WordPtr(..)
                                                 , castPtr
@@ -68,6 +68,8 @@ import           System.Posix.Memory            ( MemoryMapFlag(MemoryMapShared)
                                                 , memoryMap
                                                 , sysconfPageSize
                                                 )
+import qualified Data.Vector.Unboxed.Mutable   as V
+import qualified Data.Vector.Unboxed           as V
 
 newtype PhysAddr = PhysAddr Word64
 newtype VirtAddr a = VirtAddr (Ptr a)
@@ -143,10 +145,10 @@ dataOffset :: Int
 dataOffset = sizeOffset + sizeOf (0 :: Int)
 {-# INLINE dataOffset #-}
 
-data MemPool = MemPool { mpBaseAddr :: Ptr Word8
-                       , mpNumEntries :: Int
-                       , mpFreeBufs :: Array.IOUArray Int Int
-                       , mpTop :: IORef Int
+data MemPool = MemPool { mpBaseAddr   :: {-# UNPACK #-} !(Ptr Word8)
+                       , mpNumEntries :: {-# UNPACK #-} !Int
+                       , mpFreeBufs   :: {-# UNPACK #-} !(V.IOVector Int)
+                       , mpTop        :: {-# UNPACK #-} !(IORefU Int)
                        }
 
 mkMemPool :: (MonadThrow m, MonadIO m, MonadLogger m) => Int -> m MemPool
@@ -154,9 +156,8 @@ mkMemPool numEntries = do
   ptr <- allocateMem (numEntries * bufSize) False
   mapM_ initBuf
         [ (ptr `plusPtr` (i * bufSize), i) | i <- [0 .. numEntries - 1] ]
-  freeBufs <- liftIO
-    $ Array.newListArray (0, numEntries - 1) [0 .. numEntries - 1]
-  topRef <- liftIO $ newIORef (numEntries :: Int)
+  freeBufs <- liftIO $ V.thaw $ V.fromListN numEntries [0..]
+  topRef <- liftIO $ newIORefU (numEntries :: Int)
   return MemPool
     { mpBaseAddr   = ptr
     , mpNumEntries = numEntries
@@ -174,9 +175,9 @@ mkMemPool numEntries = do
 -- TODO: prove that unsafeRead always succeeds
 allocateBuf :: MemPool -> IO (Ptr PacketBuf)
 allocateBuf memPool = do
-  top <- subtract 1 <$> readIORef topRef
-  writeIORef topRef $! top
-  id  <- Array.unsafeRead (mpFreeBufs memPool) top
+  top <- subtract 1 <$> readIORefU topRef
+  writeIORefU topRef $! top
+  id  <- V.unsafeRead (mpFreeBufs memPool) top
   return $ idToPtr memPool id
   where
     topRef = mpTop memPool
@@ -207,9 +208,9 @@ pokeSize ptr = pokeByteOff ptr sizeOffset
 freeBuf :: MemPool -> Int -> IO ()
 freeBuf memPool id = do
   let topRef = mpTop memPool
-  top <- readIORef topRef
-  Array.unsafeWrite (mpFreeBufs memPool) top id
-  writeIORef topRef $! top + 1
+  top <- readIORefU topRef
+  V.unsafeWrite (mpFreeBufs memPool) top id
+  writeIORefU topRef $! top + 1
 {-# INLINE freeBuf #-}
 
 -- $ Utility

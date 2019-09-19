@@ -15,10 +15,11 @@ cabal-version:       >=1.10
 
 library
   hs-source-dirs:      src
-  ghc-options:         -Wall
+  ghc-options:         -fllvm -Wall -dsuppress-all -ddump-to-file -ddump-simpl -ddump-stg -ddump-llvm -O2
   exposed-modules:     Lib
   other-modules:       Lib.Prelude, Lib.Pci, Lib.Memory, Lib.Ixgbe, Lib.Ixgbe.Queue
   build-depends:       base >= 4.7 && < 5
+                     , inspection-testing
                      , array >= 0.5 && <= 0.6
                      , attoparsec >= 0.13 && < 0.14
                      , binary >= 0.8.0.0 && <= 0.10.0.0
@@ -33,6 +34,7 @@ library
                      , vector >= 0.12.0.1 && <= 0.12.0.1
                      , unix >= 2.7.0.0 && <= 2.7.2.2
                      , unix-memory >= 0.1.1 && <= 0.1.2
+                     , unboxed-ref >= 0.4 && < 0.5
   default-language:    Haskell2010
   default-extensions:  OverloadedStrings, NoImplicitPrelude, FlexibleContexts
 
@@ -50,6 +52,7 @@ executable forwarder
                      , text >= 1.2 && <= 1.2.3.0
                      , protolude >= 0.1.6 && <= 0.2.3
                      , unix >= 2.7.0.0 && <= 2.7.2.2
+                     , vector >= 0.12.0.1 && <= 0.12.0.1
   default-language:    Haskell2010
   default-extensions:  OverloadedStrings, NoImplicitPrelude, FlexibleContexts
 
